@@ -50,6 +50,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -353,12 +354,26 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
+func NameToWireFormat(name dns.Name) []byte {
+	wireLen := 1
+	for _, e := range name {
+		wireLen += 1 + len(e)
+	}
+	msg := dns.Message{
+		Question: []dns.Question{dns.Question{
+			Name: name,
+		}},
+	}
+	buf, _ := msg.WireFormat()
+	return buf[12 : 12+wireLen]
+}
+
 // responseFor constructs a response dns.Message that is appropriate for query.
 // Along with the dns.Message, it returns the query's decoded data payload. If
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
 // the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domain dns.Name, myName dns.Name, glueIP []net.IP) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -448,6 +463,40 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 
+	if question.Type == dns.RRTypeNS {
+		resp.Answer = append(resp.Answer, dns.RR{
+			Name:  question.Name,
+			Type:  dns.RRTypeNS,
+			Class: dns.ClassIN,
+			TTL:   86400,
+			Data:  NameToWireFormat(myName),
+		})
+		records := make([]dns.RR, len(glueIP))
+		for i, ip := range glueIP {
+			ip4byte := ip.To4()
+			if ip4byte == nil {
+				records[i] = dns.RR{
+					Name:  myName,
+					Type:  dns.RRTypeAAAA,
+					Class: dns.ClassIN,
+					TTL:   86400,
+					Data:  ip,
+				}
+			} else {
+				records[i] = dns.RR{
+					Name:  myName,
+					Type:  dns.RRTypeA,
+					Class: dns.ClassIN,
+					TTL:   86400,
+					Data:  ip4byte,
+				}
+			}
+		}
+		resp.Additional = append(records, resp.Additional...)
+
+		return resp, nil
+	}
+
 	if question.Type != dns.RRTypeTXT {
 		// We only support QTYPE == TXT.
 		resp.Flags |= dns.RcodeNameError
@@ -500,7 +549,7 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, myName dns.Name, glueIP []net.IP) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -515,7 +564,19 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
+		resp, payload := responseFor(&query, domain, myName, glueIP)
+		if resp != nil && resp.Question[0].Type == dns.RRTypeNS {
+			t, err := resp.WireFormat()
+			if err != nil {
+				continue
+			}
+			n, err = dnsConn.WriteTo(t, addr)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -741,7 +802,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _ := responseFor(query, dns.Name([][]byte{}), dns.Name{}, []net.IP{})
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -774,7 +835,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {
+func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, myName dns.Name, glueIP []net.IP) error {
 	defer dnsConn.Close()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -835,7 +896,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 
 	go func() {
 		defer done()
-		err := recvLoop(domain, dnsConn, ttConn, ch)
+		err := recvLoop(domain, dnsConn, ttConn, ch, myName, glueIP)
 		if err != nil {
 			log.Printf("recvLoop: %v", err)
 		}
@@ -854,6 +915,8 @@ func main() {
 	var privkeyString string
 	var pubkeyFilename string
 	var udpAddr string
+	var myNameStr string
+	var glueIPStr string
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -873,6 +936,8 @@ Example:
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
+	flag.StringVar(&myNameStr, "auth-name", "ns1.example.test", "a host which should be authoritative for the DOMAIN")
+	flag.StringVar(&glueIPStr, "glue-ips", "10.0.0.1,fd00::1", "IP addresses in glue address records")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -973,7 +1038,21 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn)
+		myName, err := dns.ParseName(myNameStr)
+		if err != nil {
+			panic(err)
+		}
+		ipList := strings.Split(glueIPStr, ",")
+		glueIP := make([]net.IP, len(ipList))
+		for i, v := range ipList {
+			ip := net.ParseIP(v)
+			if ip == nil {
+				panic("invalid IP")
+			}
+			glueIP[i] = ip
+		}
+
+		err = run(privkey, domain, upstream, dnsConn, myName, glueIP)
 		if err != nil {
 			log.Fatal(err)
 		}
